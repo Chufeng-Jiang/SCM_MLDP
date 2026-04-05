@@ -1,0 +1,63 @@
+import util.
+
+main =>
+
+    foreach(B in 17..33)  % 从17到33
+        FileName = to_fstring("./test_numbers/all_numbers/%dbit_numbers.txt", B),
+        CSVFileName = to_fstring("./test_numbers/picat_output/Base/%dBitinfoBase.csv", B),
+        
+            Lines = read_file_lines(FileName),
+            
+            % 写入CSV表头
+            CSV = open(CSVFileName, write),
+            println(CSV, "Number,BaseSize,BaseTime(s)"),
+            close(CSV),
+            
+            foreach (Line in Lines)
+                if Line.strip() != "" then  % 跳过空行
+                    C = to_int(Line.strip()),
+                    process_number(C, CSVFileName)
+                end
+            end,
+            printf("已处理文件: %s\n", FileName).
+
+% 如果直接传入数字参数
+main([CStr]) =>
+    C = to_int(CStr),
+    BaseSize = count_ones_binary(C).
+
+% 处理单个数字
+process_number(C, CSVFileName) =>
+    % 开始计时
+    statistics(runtime, [T0|_]),
+    
+    % 计算BaseSize（二进制中1的个数）
+    BaseSize = count_ones_binary(C),
+    
+    % 结束计时
+    statistics(runtime, [T1|_]),
+    
+    % 计算求解时间（秒）
+    TimeMs = T1 - T0,
+    BaseTime = TimeMs / 1000.0,  % 转换为秒
+    
+    % 写入CSV
+    CSV = open(CSVFileName, append),
+    printf(CSV, "%w,%d,%.6f\n", C, BaseSize, BaseTime),
+    close(CSV).
+
+% 统计二进制表示中1的个数
+count_ones_binary(N) = Count =>
+    if N == 0 then
+        Count = 0
+    else
+        Count = count_ones_helper(N, 0)
+    end.
+
+count_ones_helper(0, Acc) = Acc.
+count_ones_helper(N, Acc) = count_ones_helper(N >> 1, NewAcc) =>
+    if N /\ 1 == 1 then
+        NewAcc = Acc + 1
+    else
+        NewAcc = Acc
+    end.

@@ -1,0 +1,42 @@
+# Makefile.ml_extension
+# Makefile for Picat ML Socket C Extension
+
+CC = gcc
+CFLAGS = -fPIC -O3 -Wall -Wextra -I.
+LDFLAGS = -shared
+
+TARGET = picat_ml_socket.so
+SOURCE = picat_ml_socket.c
+HEADERS = bprolog.h basic.h bapi.h term.h
+
+.PHONY: all clean test install
+
+all: $(TARGET)
+
+$(TARGET): $(SOURCE) $(HEADERS)
+	@echo "Compiling ML Socket Extension..."
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $(TARGET) $(SOURCE)
+	@echo "✓ Extension compiled successfully!"
+
+clean:
+	@echo "Cleaning..."
+	rm -f $(TARGET)
+	rm -f *.o
+	@echo "✓ Cleaned!"
+
+test: $(TARGET)
+	@echo "Running tests..."
+	./picat test_ml_extension.pi
+
+install: $(TARGET)
+	@echo "Installing extension..."
+	cp $(TARGET) ~/.picat/lib/  # 或其他安装路径
+	@echo "✓ Installed!"
+
+help:
+	@echo "Available targets:"
+	@echo "  all     - Compile the extension (default)"
+	@echo "  clean   - Remove compiled files"
+	@echo "  test    - Run test suite"
+	@echo "  install - Install to system"
+	@echo "  help    - Show this help"

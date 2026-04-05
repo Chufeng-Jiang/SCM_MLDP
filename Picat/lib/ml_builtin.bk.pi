@@ -1,0 +1,14 @@
+% ml_builtin.pi
+% Picat wrapper for built-in ML extension
+
+module ml_builtin.
+
+% 使用 bp.c_XXX 调用 C 函数
+ml_predict(Context, Result) =>
+    bp.c_ML_PREDICT(Context, Result).
+
+ml_connect(Path) =>
+    bp.c_ML_CONNECT(Path).
+
+ml_disconnect() =>
+    bp.c_ML_DISCONNECT().

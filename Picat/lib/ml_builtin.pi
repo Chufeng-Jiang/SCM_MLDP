@@ -1,0 +1,116 @@
+% ml_builtin.pi
+% Picat wrapper module for built-in ML extension (GNN Support)
+% Provides convenient access to C-level ML prediction functions
+
+module ml_builtin.
+
+% ============================================================================
+% Connection Management
+% ============================================================================
+
+% ml_connect(+Path)
+% Connect to ML daemon via Unix Domain Socket
+% Path: Socket file path (e.g., '/tmp/ml_picat.sock')
+ml_connect(Path) =>
+    bp.c_ML_CONNECT(Path).
+
+% ml_disconnect()
+% Disconnect from ML daemon
+ml_disconnect() =>
+    bp.c_ML_DISCONNECT().
+
+
+% ============================================================================
+% ML Prediction Functions
+% ============================================================================
+
+% ml_predict(+Target, +CurrentMult, +History, -OpResult)
+% Predict the next operation for single constant multiplication
+%
+% Parameters:
+%   Target: Target constant (integer)
+%   CurrentMult: Current multiplier value (integer)
+%   History: List of previous equations [$eq(mult, shift, op, left, right), ...]
+%   OpResult: Predicted operation code (0-3)
+%       0 = SPLUS  (S + T)
+%       1 = SMINUS (S - T)
+%       2 = MINUSS (T - S)
+%       3 = BASE   (base case)
+%
+% Example:
+%   ml_predict(437, 109, [$eq(109,0,3,-1,-1)], Op)
+ml_predict(Target, CurrentMult, History, OpResult) =>
+    bp.c_ML_PREDICT(Target, CurrentMult, History, OpResult).
+
+
+% ml_predict_detailed(+Target, +CurrentMult, +History, -Op, -Probs)
+% Predict with detailed probability distribution
+%
+% Parameters:
+%   Target: Target constant (integer)
+%   CurrentMult: Current multiplier value (integer)
+%   History: List of previous equations
+%   Op: Predicted operation code (0-3)
+%   Probs: List of probabilities [P0, P1, P2, P3] for each operation
+%
+% Example:
+%   ml_predict_detailed(437, 109, [], Op, [P0,P1,P2,P3])
+ml_predict_detailed(Target, CurrentMult, History, Op, Probs) =>
+    bp.c_ML_PREDICT_DETAILED(Target, CurrentMult, History, Op, Probs).
+
+
+% ============================================================================
+% Helper Functions
+% ============================================================================
+
+% op_name(+OpCode, -Name)
+% Convert operation code to readable name
+op_name(0, 'SPLUS').
+op_name(1, 'SMINUS').
+op_name(2, 'MINUSS').
+op_name(3, 'BASE').
+
+
+% ============================================================================
+% Convenience Functions
+% ============================================================================
+
+% ml_predict_with_name(+Target, +CurrentMult, +History, -Op, -OpName)
+% Predict and return both code and name
+ml_predict_with_name(Target, CurrentMult, History, Op, OpName) =>
+    ml_predict(Target, CurrentMult, History, Op),
+    op_name(Op, OpName).
+
+
+% ml_predict_best(+Target, +CurrentMult, +History, -Op, -BestProb)
+% Predict and return the best operation with its probability
+ml_predict_best(Target, CurrentMult, History, Op, BestProb) =>
+    ml_predict_detailed(Target, CurrentMult, History, Op, Probs),
+    BestProb = Probs[Op+1].  % Picat lists are 1-indexed
+
+
+% format_probabilities(+Probs, -FormattedList)
+% Format probabilities as percentage strings
+format_probabilities([P0,P1,P2,P3], FormattedList) =>
+    FormattedList = [
+        $"SPLUS: {P0*100:.2f}%",
+        $"SMINUS: {P1*100:.2f}%",
+        $"MINUSS: {P2*100:.2f}%",
+        $"BASE: {P3*100:.2f}%"
+    ].
+
+
+% ============================================================================
+% Session Management (with automatic connection)
+% ============================================================================
+
+% ml_session(+SocketPath, +Goal)
+% Execute Goal within an ML session (auto-connect and disconnect)
+%
+% Example:
+%   ml_session('/tmp/ml_picat.sock', 
+%       ml_predict(437, 109, [], Op))
+ml_session(SocketPath, Goal) =>
+    ml_connect(SocketPath),
+    call(Goal),
+    ml_disconnect().

@@ -1,0 +1,169 @@
+import ordset.
+import goodRules.
+
+main =>
+    foreach(B in 32..33)  % change from 18 - 32
+        FileName = to_fstring("./test_numbers/all_numbers/%dbit_numbers.txt", B),
+        CSVFileName = to_fstring("./test_numbers/picat_output/ML/%dBitinfoML.csv", B),
+        Lines = read_file_lines(FileName),
+        
+        CSV = open(CSVFileName, write),
+        println(CSV, "Number,MLSize,MLTime(ms),MLTableBytes,MLBranchings"),
+        close(CSV),
+
+        foreach (Line in Lines)
+            C = to_int(Line),
+            process_number(C, CSVFileName)
+        end
+    end.
+
+
+main([CStr]) =>
+    C = to_int(CStr),
+    solve_SCM(C).
+
+process_number(C, CSVFileName) =>
+    initialize_table,
+    statistics(table, [Table0_bytes|_]),
+    statistics(runtime, [T0|_]),
+    
+    get_global_map().put(branch_count, 0),
+    
+    println(C),
+    printf("%d\n", C),
+    printf("%w\n", C),
+
+    once solve_SCM(C, Size, _Plan),
+    
+    statistics(runtime, [T1|_]),
+    statistics(table, [Table1_bytes|_]),
+    Branchings = get_global_map().get(branch_count),
+    
+    TimeMs = T1 - T0,
+    TableBytes = Table1_bytes - Table0_bytes,
+    
+    CSV = open(CSVFileName, append),
+    printf(CSV, "%w,%d,%d,%d,%d\n", C, Size, TimeMs, TableBytes, Branchings),
+
+    close(CSV).
+
+solve_SCM(C) =>
+   dpSCM(C, Size, Plan),
+   printf("%d equations\n", Size),
+   foreach (Step in Plan) println(Step) end.
+
+solve_SCM(C, Size, Plan) =>
+   dpSCM(C, Size, Plan).
+
+% C is an odd integer ( C's binary representation has the form 1?.*1)
+table (+, mmin, -)
+dpSCM(1, Size, Plan) =>
+    Size = 0,
+    Plan = [].
+dpSCM(C, Size, Plan), (C + 1) /\ C == 0 =>   % C = 0b11..1
+    Size = 1,
+    Shift = to_int(log(2,C+1)),
+    Plan = [$sminus(C, 1, 1, Shift)].
+dpSCM(C, Size, Plan), (C-1) /\ (C-2) == 0 => % C = 0b10...01
+    Size = 1,
+    Shift = to_int(log(2,C)),
+    Plan = [$splus(C, 1, 1, Shift)].
+  
+dpSCM(C, Size, Plan), op(C, splus) ?=>
+    split_pp(C, Left, Right, S),
+    increment_branch_count(),
+    dpSCM(Left, _, Plan1),
+    dpSCM(Right, _, Plan2),
+    Plan12 = union(Plan1, Plan2),
+    Plan = Plan12.insert($splus(C, Left, Right, S)),
+    len(Plan) = Size.
+
+dpSCM(C, Size, Plan), op(C, sminus) ?=>
+    split_pn(C, Left, Right, S),
+    increment_branch_count(),
+    dpSCM(Left, _, Plan1),
+    dpSCM(Right, _, Plan2),
+    Plan12 = union(Plan1, Plan2),
+    Plan = Plan12.insert($sminus(C, Left, Right, S)),
+    len(Plan) = Size.
+    
+dpSCM(C, Size, Plan), op(C, minuss) ?=>
+    split_np(C, Left, Right, S),
+    increment_branch_count(),
+    dpSCM(Left, _, Plan1),
+    dpSCM(Right, _, Plan2),
+    Plan12 = union(Plan1, Plan2),
+    Plan = Plan12.insert($minuss(C, Left, Right, S)),
+    len(Plan) = Size.
+
+% 增加分裂计数
+increment_branch_count() =>
+    Map = get_global_map(),
+    Count = Map.get(branch_count, 0),
+    Map.put(branch_count, Count + 1).
+
+split_pp(C, Left, Right, S) =>
+    split_pp_aux(C, Left, 0, Right, 0, S).
+
+split_pp_aux(C, Left, Right0, Right, S0, S), C /\ 1 == 1 ?=>
+     Right is Right0 + (1 << S0),
+    C1 is C >> 1,
+    C1 > 0,
+    S1 is S0+1,
+    remove_trailing_zeros(C1, Left, S1, S).
+    
+split_pp_aux(C, Left, Right0, Right, S0, S), C > 0 =>
+     Bit is C /\ 1,
+    Right1 is Right0 + (Bit << S0),
+    S1 is S0+1,
+    C1 is C >> 1,
+    split_pp_aux(C1, Left, Right1, Right, S1, S).
+
+split_pn(C, Left, Right, S) =>
+    split_pn_aux(C, Left, 1, Right, 0, S).
+
+split_pn_aux(C, Left, Right0, Right, S0, S), C == 0 =>
+    Left = 1,
+    Right = Right0,
+    S = S0.
+split_pn_aux(C, Left, Right0, Right, S0, S), C /\ 1 == 0 ?=>
+    Left = C+1,
+    Right = Right0,
+    S = S0.
+split_pn_aux(C, Left, Right0, Right, S0, S) =>
+    Bit is C /\ 1,
+    Right1 = Right0 + cond(Bit == 0, (1 << S0), 0),
+    S1 is S0+1,
+    C1 is C >> 1,
+    split_pn_aux(C1, Left, Right1, Right, S1, S).
+
+split_np(C, Left, Right, S) =>
+    N = round(log(2, C)+0.5),
+    Left0 = 2**N,
+    split_np_aux(C, N, Left0, Left, Right, 0, S).
+
+split_np_aux(C, N, Left0, Left, Right, S0, S), C > 0, C /\ 1 == 0 ?=>
+    Left = Left0-(1<<S0),
+    Right = 2**N-1-C,
+    S = S0.
+
+split_np_aux(C, N, Left0, Left, Right, S0, S), C > 0 =>
+    Bit is C /\ 1,
+    Left1 = Left0 + (Bit << S0),
+    S1 is S0+1,
+    C1 is C >> 1,
+    N1 is N-1,
+    split_np_aux(C1, N1, Left1, Left, Right, S1, S).
+
+remove_trailing_zeros(C0,C,S0,S), C0 /\ 1 == 1 => C = C0, S = S0.
+remove_trailing_zeros(C0,C,S0,S) =>
+    C1 is C0 >> 1,
+    S1 is S0+1,
+    remove_trailing_zeros(C1,C,S1,S).
+
+output(splus(C, Left, Right, Shift)) =>
+    println($(C = Left*(1<<Shift)+Right)).
+output(sminus(C, Left, Right, Shift)) =>
+    println($(C = Left*(1<<Shift)-Right)).
+output(minuss(C, Left, Right, Shift)) =>
+    println($(C = Left-Right*(1<<Shift))).
