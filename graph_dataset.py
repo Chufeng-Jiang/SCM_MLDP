@@ -1,52 +1,56 @@
-"""graph_dataset_integrated.py: PyG Dataset with ALL features integrated (199-dim nodes)
+"""
+SCMGraphDataset: PyTorch Geometric Dataset for Structured Causal Models (SCM).
 
-FEATURE DIMENSIONS:
-- Node features: 199-dim (170 original + 8 factor_quality + 21 decomposition_pattern)
-- Edge features: 12-dim
-- Target features: 22-dim
+This module converts Picat-style integer decomposition traces into graph-structured
+training examples for graph neural networks. Each JSON sample contains a target
+constant ``c`` and an ordered list of decomposition equations. For each prefix
+length ``k``, the dataset constructs a partial computational graph and defines
+the next decomposition operation as the supervised prediction target.
 
-NEW FEATURES ADDED:
-1. Factor Quality Features (8-dim) - Based on Picat decomposition patterns
-2. Decomposition Pattern Features (21-dim) - Split potential analysis
-3. Reuse Pattern Detection - Enhanced reuse pattern classification
+Key design choices
+------------------
+1. Prefix-based supervision: each original SCM trace yields multiple graph
+   examples, one for each partial decomposition state.
+2. DFS ordering: graph prefixes follow a left-first DFS traversal that mirrors
+   the decomposition order used by the Picat solver.
+3. Rich numerical encodings: node features combine logarithmic, bit-level,
+   shift-centric, dependency, and pattern-specific descriptors.
+4. Hybrid caching: generated PyG ``Data`` objects can be cached in memory and,
+   optionally, persisted to disk to reduce repeated preprocessing overhead.
+
+The implementation intentionally keeps feature construction explicit rather
+than highly abstracted, making the feature engineering assumptions transparent
+for research analysis and ablation studies.
 """
 
+
 import json
-import torch
-from torch_geometric.data import Data, Dataset
-import os
 import math
-import numpy as np
-from functools import lru_cache
+import os
 import pickle
 from pathlib import Path
 
+import numpy as np
+import torch
+from torch_geometric.data import Data, Dataset
+
+# Note: numpy and functools-style caching utilities are kept available for
+# experimentation with future feature ablations and preprocessing variants.
+from functools import lru_cache
+
 
 class SCMGraphDataset(Dataset):
-    """
-    PyG Dataset for SCM (Single Constant Multiplication) with Top-Down decomposition.
-    
-    LAZY LOADING WITH CACHE VERSION with ALL FEATURES INTEGRATED
-    
-    Node features: 199-dim breakdown:
-      - mult features: 22-dim
-      - shifted_operand features: 44-dim  
-      - op features: 4-dim
-      - dependency features: 6-dim
-      - tree_level features: 8-dim
-      - operand_relationship features: 12-dim
-      - bit_distance features: 5-dim
-      - gap features: 9-dim
-      - theoretical_shifts features: 3-dim
-      - pairwise_potential features: 8-dim
-      - positional features: 6-dim
-      - topdown_specific features: 5-dim
-      - factor_quality features: 8-dim (NEW)
-      - decomposition_pattern features: 21-dim (NEW)
-      - bit features: 32-dim
-      - special_pattern features: 6-dim
-    
-    Edge features: 12-dim
+    """Dataset wrapper that materializes SCM decomposition states as PyG graphs.
+
+    The dataset follows the PyTorch Geometric ``Dataset`` interface. Instead of
+    storing all graphs in memory at initialization time, it indexes all valid
+    ``(sample_idx, prefix_len)`` pairs and builds each graph lazily in ``get``.
+    This is important because a single SCM trace can generate many supervised
+    states and each state contains a high-dimensional feature representation.
+
+    Attributes:
+        MAX_OP: Number of operation classes encoded by one-hot features.
+        MAX_NODES: Fixed upper bound used by node-selection masks.
     """
 
     MAX_OP = 4
@@ -55,17 +59,20 @@ class SCMGraphDataset(Dataset):
     def __init__(self, json_path, transform=None, pre_transform=None, max_prefix_len=8,
                  split_type='all', train_targets=None, test_targets=None, max_shift=32,
                  cache_size=5000, disk_cache_dir=None, use_disk_cache=False):
-        """
+        """Initialize dataset metadata, filtering rules, and cache backends.
+
         Args:
-            json_path: Path to JSON file
-            max_prefix_len: Maximum prefix length
-            split_type: 'all', 'train', or 'test'
-            train_targets: List of training targets
-            test_targets: List of test targets
-            max_shift: Maximum shift value
-            cache_size: Size of in-memory LRU cache (default: 5000)
-            disk_cache_dir: Directory for disk cache (default: None)
-            use_disk_cache: Whether to use persistent disk cache (default: False)
+            json_path: Path to the SCM trace JSON file.
+            transform: Optional PyG transform applied after graph construction.
+            pre_transform: Optional PyG pre-transform hook.
+            max_prefix_len: Maximum number of prefix states generated per trace.
+            split_type: One of ``'all'``, ``'train'``, or ``'test'``.
+            train_targets: Target constants assigned to the training split.
+            test_targets: Target constants assigned to the testing split.
+            max_shift: Maximum shift class considered by the model.
+            cache_size: Maximum number of graphs retained in the in-memory LRU cache.
+            disk_cache_dir: Optional directory for persistent graph cache files.
+            use_disk_cache: Whether to read/write generated graphs as pickle files.
         """
 
         self.json_path = json_path
@@ -77,7 +84,8 @@ class SCMGraphDataset(Dataset):
         self.cache_size = cache_size
         self.use_disk_cache = use_disk_cache
 
-        # Setup disk cache
+        # Configure optional persistent caching. Disk caching is useful when
+        # graph construction becomes a bottleneck across repeated experiments.
         if use_disk_cache:
             if disk_cache_dir is None:
                 disk_cache_dir = os.path.join(
@@ -89,16 +97,21 @@ class SCMGraphDataset(Dataset):
         else:
             self.disk_cache_dir = None
 
-        # Load and filter samples
+        # Load raw traces, apply split filtering, and precompute DFS order once.
         self._load_samples()
         
-        # Initialize in-memory cache
+        # Initialize the runtime cache after all indexing metadata is ready.
         self._init_cache()
         
         super().__init__(os.path.dirname(json_path), transform, pre_transform)
 
     def _load_samples(self):
-        """Load JSON and create index mapping"""
+        """Load raw SCM traces and build the flat graph index.
+
+        Each retained sample contributes up to ``max_prefix_len`` graph states.
+        ``index_map`` converts a PyG dataset index into the corresponding raw
+        sample and prefix length, enabling lazy graph construction in ``get``.
+        """
         with open(self.json_path, "r") as f:
             raw = json.load(f)
 
@@ -109,7 +122,8 @@ class SCMGraphDataset(Dataset):
         for sample_idx, sample in enumerate(raw):
             target = int(sample["c"])
             
-            # Filter by split
+            # Split filtering is target-based, which supports controlled
+            # generalization experiments over held-out constants.
             if self.split_type == 'train' and target not in self.train_targets:
                 continue
             elif self.split_type == 'test' and target not in self.test_targets:
@@ -117,12 +131,15 @@ class SCMGraphDataset(Dataset):
             
             self.samples.append(sample)
             
-            # Precompute DFS order
+            # Precompute traversal order so each prefix can be reconstructed
+            # consistently without repeating DFS during every ``get`` call.
             dfs_order = self._compute_dfs_order(sample["equations"])
             self.dfs_orders.append(dfs_order)
             
             N = len(sample["equations"])
             
+            # Each prefix length becomes one supervised graph example.
+            # k=0 corresponds to the initial target-only state.
             for k in range(0, min(N, self.max_prefix_len)):
                 self.index_map.append((sample_idx, k))
 
@@ -164,24 +181,28 @@ class SCMGraphDataset(Dataset):
         return order
 
     def _init_cache(self):
-        """Initialize in-memory cache"""
+        """Reset the lightweight in-memory LRU cache and hit/miss counters."""
         self._cache = {}
         self._cache_order = []
         self.cache_hits = 0
         self.cache_misses = 0
 
     def _get_cache_key(self, sample_idx, k):
-        """Generate cache key for a graph"""
+        """Return a stable key identifying one generated prefix graph."""
         return (sample_idx, k)
 
     def _get_disk_cache_path(self, sample_idx, k):
-        """Get path for disk cache file"""
+        """Return the pickle path for a cached graph, or ``None`` if disabled."""
         if self.disk_cache_dir is None:
             return None
         return self.disk_cache_dir / f"graph_{sample_idx}_{k}.pkl"
 
     def _load_from_disk_cache(self, sample_idx, k):
-        """Load graph from disk cache"""
+        """Load a previously materialized graph from disk when available.
+
+        Corrupted cache entries are removed defensively so that the graph can be
+        rebuilt from the raw JSON trace.
+        """
         if not self.use_disk_cache:
             return None
         
@@ -196,7 +217,7 @@ class SCMGraphDataset(Dataset):
         return None
 
     def _save_to_disk_cache(self, sample_idx, k, data):
-        """Save graph to disk cache"""
+        """Persist a generated graph to disk for future runs."""
         if not self.use_disk_cache:
             return
         
@@ -208,7 +229,7 @@ class SCMGraphDataset(Dataset):
             pass
 
     def _update_cache(self, key, data):
-        """Update in-memory cache with LRU policy"""
+        """Insert or refresh a graph in the in-memory LRU cache."""
         if key in self._cache:
             self._cache_order.remove(key)
         
@@ -220,11 +241,16 @@ class SCMGraphDataset(Dataset):
             del self._cache[oldest_key]
 
     def len(self):
-        """Return total number of graphs"""
+        """Return the number of prefix-level graph examples in this dataset."""
         return len(self.index_map)
 
     def get(self, idx):
-        """Generate graph on-the-fly for given index with caching"""
+        """Return one PyG ``Data`` object, using cache layers before rebuilding.
+
+        The retrieval order is: in-memory cache -> disk cache -> graph builder.
+        This keeps repeated training/evaluation passes efficient while avoiding
+        the upfront cost of materializing every graph.
+        """
         sample_idx, k = self.index_map[idx]
         cache_key = self._get_cache_key(sample_idx, k)
         
@@ -244,7 +270,7 @@ class SCMGraphDataset(Dataset):
                 self._update_cache(cache_key, data)
                 return data
         
-        # Build graph
+        # Cache miss: materialize the requested prefix graph from the raw trace.
         sample = self.samples[sample_idx]
         equations = sample["equations"]
         target = int(sample["c"])
@@ -262,7 +288,7 @@ class SCMGraphDataset(Dataset):
         return data
 
     def get_cache_stats(self):
-        """Get cache statistics"""
+        """Return runtime cache statistics for profiling preprocessing overhead."""
         total_requests = self.cache_hits + self.cache_misses
         hit_rate = self.cache_hits / total_requests if total_requests > 0 else 0
         
@@ -276,20 +302,20 @@ class SCMGraphDataset(Dataset):
         }
 
     def clear_cache(self):
-        """Clear in-memory cache"""
+        """Clear all in-memory cached graphs and reset cache counters."""
         self._cache.clear()
         self._cache_order.clear()
         self.cache_hits = 0
         self.cache_misses = 0
 
     def clear_disk_cache(self):
-        """Clear disk cache"""
+        """Remove all persisted graph cache files created by this dataset."""
         if self.disk_cache_dir and self.disk_cache_dir.exists():
             for cache_file in self.disk_cache_dir.glob("graph_*.pkl"):
                 cache_file.unlink()
 
     def precompute_all(self, verbose=True):
-        """Precompute all graphs and cache them"""
+        """Materialize every indexed graph once to warm memory/disk caches."""
         if verbose:
             print(f"Precomputing {len(self)} graphs...")
         
@@ -317,7 +343,7 @@ class SCMGraphDataset(Dataset):
         return v
 
     def compute_bit_features(self, value):
-        """32-bit representation of value (32-dim)"""
+        """Encode an integer as a normalized 32-bit binary indicator vector."""
         if value < 0 or value >= (1 << 32):
             return [0.0] * 32
         
@@ -329,7 +355,7 @@ class SCMGraphDataset(Dataset):
         return bit_features
 
     def compute_log_positional_features(self, value, reference=None):
-        """Log-space continuous representation (10-dim)"""
+        """Compute scale-aware logarithmic and positional number features."""
         if value == 0:
             return [0.0] * 10
         
@@ -371,7 +397,7 @@ class SCMGraphDataset(Dataset):
         ]
     
     def compute_shift_centric_features(self, value, reference=None):
-        """Shift-centric features for SCM (12-dim)"""
+        """Extract features that indicate whether shifts are useful for decomposition."""
         if value == 0:
             return [0.0] * 12
         
@@ -427,13 +453,13 @@ class SCMGraphDataset(Dataset):
         ]
     
     def compute_compact_number_features(self, value, reference=None):
-        """Combine log-positional and shift-centric features (22-dim)"""
+        """Concatenate the compact 22-dimensional numeric representation."""
         log_pos = self.compute_log_positional_features(value, reference)
         shift_cent = self.compute_shift_centric_features(value, reference)
         return log_pos + shift_cent
 
     def compute_dependency_features(self, node_idx, left_idx, right_idx, prefix_len):
-        """Dependency relationship features (6-dim)"""
+        """Describe operand-node distances within the current prefix graph."""
         if left_idx >= 0:
             left_distance = abs(left_idx - node_idx) / max(prefix_len - 1, 1)
         else:
@@ -461,7 +487,7 @@ class SCMGraphDataset(Dataset):
         ]
     
     def compute_tree_level_features(self, eq_idx, eq, equations, sorted_nodes, eq_idx_to_graph_idx):
-        """Tree hierarchy features (8-dim)"""
+        """Describe root/leaf status, operand balance, and hierarchy position."""
         mult = eq["mult"]
         left_idx = eq.get("left", -1)
         right_idx = eq.get("right", -1)
@@ -510,7 +536,7 @@ class SCMGraphDataset(Dataset):
         ]
 
     def compute_operand_relationship_features(self, eq, equations, nodes_in_graph=None):
-        """Relationship between node and its operands (12-dim)"""
+        """Measure how well operands reconstruct the current equation value."""
         mult = eq["mult"]
         op = eq.get("op", 3)
         shift = eq.get("shift", 0)
@@ -605,8 +631,10 @@ class SCMGraphDataset(Dataset):
         ]
 
     def compute_shifted_operand_features(self, eq, equations, nodes_in_graph=None):
-        """Compact features for shifted operands (44-dim = 22+22)"""
+        """Encode left/right operands after applying the operation-specific shift."""
         op = eq.get("op", 3)
+        # Defensive checks keep invalid traces from silently producing corrupted
+        # feature vectors. These assumptions match the SCM trace schema.
         assert 0 <= op <= 3, f"Invalid op={op}"
         
         shift = eq.get("shift", 0)
@@ -657,7 +685,7 @@ class SCMGraphDataset(Dataset):
         return left_features + right_features
 
     def compute_bit_distance_features(self, mult, target):
-        """Bit-level distance to target (5-dim)"""
+        """Compare current value and target using bitwise overlap/difference signals."""
         xor_result = mult ^ target
         bit_diff_ratio = bin(xor_result).count('1') / 32.0
         
@@ -676,7 +704,7 @@ class SCMGraphDataset(Dataset):
         return [bit_diff_ratio, common_ones_ratio, coverage_ratio, set_ratio, clear_ratio]
     
     def compute_gap_features(self, mult, target):
-        """Gap analysis features (9-dim)"""
+        """Quantify arithmetic distance between current value and target."""
         gap = abs(target - mult)
         if target == 0:
             return [0.0] * 9
@@ -700,7 +728,7 @@ class SCMGraphDataset(Dataset):
         return [x if math.isfinite(x) else 0.0 for x in result]
     
     def compute_theoretical_shifts(self, mult, target):
-        """Theoretical shift hints (3-dim)"""
+        """Estimate whether scale differences suggest useful shift magnitudes."""
         if mult > 1:
             ratio = target / mult if target > mult else mult / max(target, 1)
             shift_hint_decompose = math.log2(max(ratio, 1))
@@ -714,7 +742,7 @@ class SCMGraphDataset(Dataset):
         return [shift_hint_decompose, shift_hint_bitlen, shift_hint_avg]
     
     def compute_pairwise_potential_stats(self, graph_idx, sorted_nodes, equations, target):
-        """Pairwise combination potential (8-dim)"""
+        """Evaluate whether the current node combines well with previous nodes."""
         eq_idx = sorted_nodes[graph_idx]
         mult_i = equations[eq_idx]["mult"]
         
@@ -771,7 +799,7 @@ class SCMGraphDataset(Dataset):
         return [x if math.isfinite(x) else 0.0 for x in result]
     
     def compute_positional_features(self, node_idx, prefix_len):
-        """Positional encoding (6-dim)"""
+        """Encode the node position within the current prefix graph."""
         abs_pos = node_idx / max(prefix_len - 1, 1)
         dist_from_start = abs_pos
         dist_from_end = 1.0 - abs_pos
@@ -783,7 +811,7 @@ class SCMGraphDataset(Dataset):
         return [abs_pos, dist_from_start, dist_from_end, pe_sin, pe_cos, is_first]
     
     def compute_topdown_specific_features(self, mult, equations, eq_idx, sorted_nodes):
-        """Top-Down decomposition specific features (5-dim)"""
+        """Capture progress indicators for top-down SCM decomposition."""
         if eq_idx == 0:
             decomp_progress = 0.0
         else:
@@ -1122,7 +1150,7 @@ class SCMGraphDataset(Dataset):
 
     def compute_edge_features(self, src_eq_idx, dst_eq_idx, eq, equations, 
                              is_next_step=False, is_self_loop=False, is_both=False):
-        """Edge features (12-dim)"""
+        """Build edge attributes describing operand roles and structural edge type."""
         if is_next_step or is_self_loop:
             return [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
                     float(not is_self_loop), float(is_next_step), float(is_self_loop)]
@@ -1165,11 +1193,11 @@ class SCMGraphDataset(Dataset):
         ]
     
     def compute_target_features(self, target):
-        """Target compact representation (22-dim)"""
+        """Return the same compact numeric representation for the target constant."""
         return self.compute_compact_number_features(target, reference=None)
     
     def compute_special_pattern_features(self, value):
-        """Special patterns recognized by Picat solver (6-dim)"""
+        """Detect solver-friendly integer patterns such as powers of two."""
         if value <= 0:
             return [0.0] * 6
         
@@ -1273,7 +1301,8 @@ class SCMGraphDataset(Dataset):
             if eq_idx < len(equations):
                 available_mults.add(equations[eq_idx]["mult"])
         
-        # Build node features with ALL 199 dimensions
+        # Build node features. The order below is fixed and must stay aligned
+        # with ``get_node_feature_dim`` and downstream model input layers.
         x_list = []
         
         if k == 0:
@@ -1396,7 +1425,9 @@ class SCMGraphDataset(Dataset):
         
         x = torch.stack(x_list, dim=0)
 
-        # Build edges (same as before)
+        # Build directed edges from each decomposed equation to its operands.
+        # Additional prediction/self-loop edges stabilize message passing when
+        # the prefix graph is sparse or contains isolated nodes.
         edge_src, edge_dst, edge_attr_list = [], [], []
         existing_edges = {}
 
@@ -1491,7 +1522,9 @@ class SCMGraphDataset(Dataset):
         edge_index = torch.tensor([edge_src, edge_dst], dtype=torch.long)
         edge_attr = torch.tensor(edge_attr_list, dtype=torch.float32)
 
-        # Labels
+        # Supervision labels: the model predicts the next decomposition step
+        # from the current prefix graph. Labels include operation, shift, operand
+        # selection, operand values, and reuse-pattern metadata.
         next_step = equations[k]
         y_shift = max(1, min(self.MAX_SHIFT, next_step.get("shift", 0))) - 1
         y_op = next_step.get("op", 3)
@@ -1539,8 +1572,10 @@ class SCMGraphDataset(Dataset):
         if num_available > 0:
             available_mask[:min(num_available, FIXED_MAX_NODES)] = True
 
+        # Package the graph, edge features, labels, and auxiliary metadata into
+        # a PyTorch Geometric Data object consumed directly by GNN training code.
         data = Data(
-            x=x,  # 199-dim node features
+            x=x,  # 199-dimensional node feature matrix: [num_nodes, 199]
             edge_index=edge_index,
             edge_attr=edge_attr,
             
@@ -1576,13 +1611,13 @@ class SCMGraphDataset(Dataset):
         return data
 
     def get_node_feature_dim(self):
-        """Node feature dimension: 199"""
+        """Return the fixed node feature dimension used by this dataset."""
         return 199
 
     def get_edge_feature_dim(self):
-        """Edge feature dimension: 12"""
+        """Return the fixed edge feature dimension used by this dataset."""
         return 12
 
     def get_target_feature_dim(self):
-        """Target feature dimension: 22"""
+        """Return the dimensionality of target-level numeric features."""
         return 22

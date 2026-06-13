@@ -1,3 +1,32 @@
+"""
+op_inference_simple.py
+
+GNN-based operation inference script for Structured Causal Model (SCM)
+decomposition.
+
+This script loads a trained SimpleSCMGNN checkpoint and applies it to one or
+more inference requests. Each request contains a target constant, the current
+multiplier/constant to be decomposed, and an optional history of previous
+decomposition steps. The script reconstructs a PyTorch Geometric graph from the
+history, computes the same 199-dimensional node feature representation expected
+by the model, and predicts the next operation type.
+
+Predicted operation classes:
+    0: SPLUS   -> shifted-plus decomposition
+    1: SMINUS  -> shifted-minus decomposition
+    2: MINUSS  -> minus-shifted decomposition
+    3: BASE    -> base-case / terminal operation
+
+Main workflow:
+    1. Load checkpoint and recover model hyperparameters.
+    2. Rebuild graph features for each inference request.
+    3. Run the trained GNN in evaluation mode.
+    4. Export operation probabilities to CSV for downstream analysis.
+
+This file is intended for research-oriented inference and confidence analysis,
+not for model training.
+"""
+
 import torch
 import json
 import csv
@@ -13,8 +42,27 @@ from graph_dataset import SCMGraphDataset
 
 
 class GNNSimpleInference:
+    """
+    Lightweight inference wrapper for SimpleSCMGNN.
+
+    The class encapsulates checkpoint loading, graph reconstruction, feature
+    computation, single-step inference, batch inference, and CSV export. This
+    keeps the command-line interface simple while preserving the same feature
+    construction protocol used during training.
+    """
     
     def __init__(self, model_path, device='cuda'):
+        """
+        Load a trained SimpleSCMGNN checkpoint and prepare inference utilities.
+
+        Args:
+            model_path (str):
+                Path to the saved model checkpoint. The checkpoint is expected
+                to contain `model_state_dict` and optionally a `config` dict.
+            device (str):
+                Preferred inference device. If CUDA is requested but unavailable,
+                the script automatically falls back to CPU.
+        """
 
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         print(f"🔧 Device: {self.device}")
@@ -27,7 +75,7 @@ class GNNSimpleInference:
             if key in config:
                 print(f"   - {key}: {config[key]}")
         
-        # 简化的模型配置 - 仅需要基本参数
+        # Recover the minimal model configuration required for inference.
         model_config = {
             'node_in_dim': config.get('node_in_dim', 199),
             'edge_in_dim': config.get('edge_in_dim', 12),
@@ -35,7 +83,7 @@ class GNNSimpleInference:
             'num_heads': config.get('num_heads', 8),
             'conv_type': config.get('conv_type', 'gatv2'),
             'num_gnn_layers': config.get('num_gnn_layers', 4),
-            'dropout': 0.0,  # Inference时dropout设为0
+            'dropout': 0.0,  # Disable dropout during deterministic inference.
         }
         
         self.model = SimpleSCMGNN(**model_config).to(self.device)
@@ -47,24 +95,32 @@ class GNNSimpleInference:
         print(f"   - GNN layers: {model_config['num_gnn_layers']}")
         print(f"   - Conv type: {model_config['conv_type']}")
         
-        # Create dataset helper for feature computations
+        # Create a lightweight dataset helper for reusing feature functions.
+        # __new__ avoids loading the full dataset while still allowing access
+        # to feature-computation methods defined in SCMGraphDataset.
         self.dataset_helper = SCMGraphDataset.__new__(SCMGraphDataset)
-        self.dataset_helper.MAX_SHIFT = 32  # 保持兼容性，虽然不再使用
+        self.dataset_helper.MAX_SHIFT = 32  # Keep feature computation compatible with training.
         self.dataset_helper.MAX_NODES = 11
         self.dataset_helper.MAX_OP = 4
         
         self.op_names = {0: 'SPLUS', 1: 'SMINUS', 2: 'MINUSS', 3: 'BASE'}
     
     def _safe_compute_shifted_operand_features(self, eq, history_equations, nodes_set):
-        """calculate shifted operand features safely"""
+        """
+        Compute shifted-operand features with defensive fallbacks.
+
+        During inference, partial histories may not contain all operands used by
+        the original decomposition. Invalid or missing operand indices are mapped
+        to a zero vector so that feature dimensionality remains stable.
+        """
         left_idx = eq.get("left", -1)
         right_idx = eq.get("right", -1)
         
-        # if left or right is -1, return zero features
+        # Missing operands are represented by a zero feature vector.
         if left_idx == -1 or right_idx == -1:
             return [0.0] * 44  # shifted operand features is 44-dim
         
-        # if indices are valid, compute features
+        # Compute features only when operand indices are within the expected range.
         if 0 <= left_idx <= 9 and 0 <= right_idx <= 9:
             try:
                 return self.dataset_helper.compute_shifted_operand_features(
@@ -76,11 +132,16 @@ class GNNSimpleInference:
             return [0.0] * 44
     
     def _safe_compute_operand_relationship_features(self, eq, history_equations, nodes_set):
-        """calculate operand relationship features safely"""
+        """
+        Compute operand-relationship features with robust missing-index handling.
+
+        The function protects inference from incomplete graph histories by
+        returning a zero vector whenever operands are unavailable or invalid.
+        """
         left_idx = eq.get("left", -1)
         right_idx = eq.get("right", -1)
 
-        # if left or right is -1, return zero features
+        # Missing operands are represented by a zero feature vector.
         if left_idx == -1 or right_idx == -1:
             return [0.0] * 10
         
@@ -98,7 +159,14 @@ class GNNSimpleInference:
                                       history_equations, graph_idx, 
                                       num_graph_nodes, sorted_nodes, 
                                       eq_idx_to_graph_idx):
-        """calculate node features for a given equation"""
+        """
+        Construct the 199-dimensional node feature vector for one graph node.
+
+        The feature vector mirrors the representation used during model training:
+        compact numerical features, operand/shift features, dependency features,
+        bit-level features, target-distance features, and special pattern flags.
+        Any non-finite value is replaced with zero before returning.
+        """
         
         op = eq.get('op', 3)
         nodes_set = set(sorted_nodes)
@@ -178,7 +246,7 @@ class GNNSimpleInference:
         # 14. Special pattern features (6-dim)
         special_pattern_feat = self.dataset_helper.compute_special_pattern_features(mult)
         
-        # combine all features
+        # Concatenate all feature groups into the final node representation.
         all_feat = (
             mult_feat + shifted_feat + op_feat + dep_feat + 
             tree_feat + operand_feat + bit_feat + gap_feat +
@@ -186,10 +254,10 @@ class GNNSimpleInference:
             mult_bit_feat + special_pattern_feat
         )
         
-        # clean NaN/Inf values
+        # Replace NaN/Inf values to avoid invalid tensor values at inference time.
         all_feat = [x if math.isfinite(x) else 0.0 for x in all_feat]
         
-        # ensure 199-dim
+        # Enforce the expected model input dimensionality.
         if len(all_feat) != 199:
             if len(all_feat) < 199:
                 all_feat.extend([0.0] * (199 - len(all_feat)))
@@ -199,10 +267,26 @@ class GNNSimpleInference:
         return all_feat
     
     def build_graph_from_history(self, current_mult, history_equations, target):
-        """build graph from history - consistent with training"""
+        """
+        Reconstruct a PyTorch Geometric graph from an inference history.
+
+        Args:
+            current_mult (int):
+                Current multiplier/constant that the model should decompose.
+            history_equations (list[dict]):
+                Previous decomposition steps. Each step may include `mult`, `op`,
+                `shift`, `left`, and `right`.
+            target (int):
+                Original target constant for contextual feature computation.
+
+        Returns:
+            torch_geometric.data.Data:
+                A graph containing node features, directed edges, and edge
+                attributes suitable for SimpleSCMGNN inference.
+        """
         k = len(history_equations)
         
-        # Sort nodes by mult value
+        # Use multiplier values as inference-time graph nodes.
         if k > 0:
             sorted_nodes = sorted(
                 set(eq['mult'] for eq in history_equations),
@@ -251,7 +335,7 @@ class GNNSimpleInference:
             
             x_list.append(feat)
         
-        # Add prediction node (next step node)
+        # Add a prediction node representing the current decomposition state.
         pred_node_feat = self._compute_node_features_simple(
             mult=current_mult,
             target=target,
@@ -267,14 +351,14 @@ class GNNSimpleInference:
         
         x = torch.tensor(x_list, dtype=torch.float32)
         
-        # Build edge_index and edge_attr
+        # Build PyG edge_index and edge attributes.
         edge_src = []
         edge_dst = []
         edge_attr_list = []
         
         pred_node_idx = num_graph_nodes
         
-        # 1. Dependency edges (from history)
+        # 1. Historical dependency edges reconstructed from previous steps.
         for eq_idx, eq in enumerate(history_equations):
             left_idx = eq.get('left', -1)
             right_idx = eq.get('right', -1)
@@ -283,7 +367,7 @@ class GNNSimpleInference:
             if src_graph_idx == -1:
                 continue
             
-            # left dependency
+            # Left-operand dependency edge.
             if left_idx != -1 and left_idx in eq_idx_to_graph_idx:
                 dst_graph_idx = eq_idx_to_graph_idx[left_idx]
                 edge_src.append(src_graph_idx)
@@ -295,7 +379,7 @@ class GNNSimpleInference:
                 )
                 edge_attr_list.append(edge_feat)
             
-            # right dependency
+            # Right-operand dependency edge.
             if right_idx != -1 and right_idx in eq_idx_to_graph_idx:
                 dst_graph_idx = eq_idx_to_graph_idx[right_idx]
                 edge_src.append(src_graph_idx)
@@ -307,19 +391,19 @@ class GNNSimpleInference:
                 )
                 edge_attr_list.append(edge_feat)
         
-        # 2. Self-loops for existing nodes
+        # 2. Self-loops preserve each node's own representation.
         for i in range(num_graph_nodes):
             edge_src.append(i)
             edge_dst.append(i)
             edge_attr_list.append([1.0] + [0.0] * 11)
         
-        # 3. Connect prediction node to all history nodes
+        # 3. Connect the prediction node to historical nodes for context.
         for i in range(num_graph_nodes):
             edge_src.append(pred_node_idx)
             edge_dst.append(i)
             edge_attr_list.append([0.0] * 12)
         
-        # 4. Prediction node self-loop
+        # 4. Add a self-loop for the prediction node.
         if num_graph_nodes == 0 or True:  # Always add self-loop for prediction node
             edge_src.append(pred_node_idx)
             edge_dst.append(pred_node_idx)
@@ -328,7 +412,7 @@ class GNNSimpleInference:
         edge_index = torch.tensor([edge_src, edge_dst], dtype=torch.long)
         edge_attr = torch.tensor(edge_attr_list, dtype=torch.float32)
         
-        # Construct Data object
+        # Construct the PyTorch Geometric Data object consumed by the model.
         data = Data(
             x=x,
             edge_index=edge_index,
@@ -338,7 +422,12 @@ class GNNSimpleInference:
         return data
     
     def predict_next_action(self, current_mult, history_equations, target):
-        """predict next action with detailed op probabilities"""
+        """
+        Predict the next operation type for a single decomposition state.
+
+        Returns a dictionary containing the predicted operation ID, its symbolic
+        name, and the full probability distribution over all operation classes.
+        """
         # Build graph data
         data = self.build_graph_from_history(current_mult, history_equations, target)
         data = data.to(self.device)
@@ -352,7 +441,7 @@ class GNNSimpleInference:
             op_probs = torch.softmax(op_logits, dim=-1).squeeze(0)  # shape: [4]
             op_predicted = op_probs.argmax().item()
             
-            # construct op probabilities dict
+            # Convert probabilities to a plain Python dictionary for logging/CSV export.
             op_probabilities = {
                 i: float(op_probs[i].item()) 
                 for i in range(len(op_probs))
@@ -366,11 +455,17 @@ class GNNSimpleInference:
     
     def load_input_file(self, json_path: str, start_c: Optional[int] = None, 
                        end_c: Optional[int] = None) -> List[Dict[str, Any]]:
-        """Load JSON input file with optional constant range filtering"""
+        """
+        Load inference requests from a JSON file with optional range filtering.
+
+        The expected input format is a list of request dictionaries containing
+        `target`, `current_mult`, and optionally `history`. The optional range
+        filter is applied to `current_mult`.
+        """
         with open(json_path, 'r') as f:
             data = json.load(f)
         
-        # Filter by constant range if specified
+        # Apply optional filtering to restrict inference to a constant range.
         if start_c is not None or end_c is not None:
             original_count = len(data)
             filtered_data = []
@@ -395,7 +490,13 @@ class GNNSimpleInference:
     
     def predict_batch_from_file(self, json_path: str, output_path: Optional[str] = None,
                                start_c: Optional[int] = None, end_c: Optional[int] = None):
-        """batch prediction from input file and save to CSV"""
+        """
+        Run batch inference over all requests in an input JSON file.
+
+        If `output_path` is provided, the script writes a CSV file containing
+        the predicted probability for each operation class and basic timing
+        statistics for reproducibility and profiling.
+        """
         # Record start time
         start_time = time.time()
         
@@ -414,7 +515,7 @@ class GNNSimpleInference:
             current_mult = req['current_mult']
             history = req.get('history', [])
             
-            # Calculate progress percentage
+            # Track progress and elapsed time for long-running inference jobs.
             progress = (idx + 1) / len(requests) * 100
             elapsed = time.time() - start_time
             
@@ -450,7 +551,7 @@ class GNNSimpleInference:
                     'error': str(e)
                 })
         
-        # Calculate total time
+        # Summarize throughput after all requests have been processed.
         total_time = time.time() - start_time
         avg_time_per_sample = total_time / len(requests) if len(requests) > 0 else 0
         
@@ -470,7 +571,13 @@ class GNNSimpleInference:
     
     def _save_to_csv(self, results: List[Dict], output_path: str, 
                     total_time: float, avg_time: float):
-        """Save results to CSV file with timing info"""
+        """
+        Save operation probabilities and timing metadata to a CSV file.
+
+        The first rows store timing information as comment-like rows, followed
+        by one row per input constant. Failed samples are recorded with zero
+        probabilities to preserve row alignment.
+        """
         with open(output_path, 'w', newline='') as csvfile:
             writer = csv.writer(csvfile)
             
@@ -506,7 +613,12 @@ class GNNSimpleInference:
     
     def predict_single(self, target: int, current_mult: int, 
                       history: List[Dict] = None):
-        """single step prediction"""
+        """
+        Run and print inference for one manually specified decomposition state.
+
+        This method is useful for debugging individual examples before running
+        the full batch prediction pipeline.
+        """
         if history is None:
             history = []
         
@@ -534,6 +646,7 @@ class GNNSimpleInference:
 
 
 def main():
+    """Parse command-line arguments and run batch inference."""
     parser = argparse.ArgumentParser(description='GNN Simple Inference Script - CSV Output (Op Only)')
     parser.add_argument('--model', type=str, required=True,
                         help='model path (e.g., best_model_simple.pth)')
@@ -556,13 +669,13 @@ def main():
             print(f"❌ Error: start-c ({args.start_c}) must be <= end-c ({args.end_c})")
             return
     
-    # create inferencer
+    # Initialize the inference wrapper and load the trained checkpoint.
     inferencer = GNNSimpleInference(
         model_path=args.model,
         device=args.device
     )
     
-    # batch predict from file
+    # Run batch inference and optionally export results to CSV.
     inferencer.predict_batch_from_file(
         json_path=args.input,
         output_path=args.output,

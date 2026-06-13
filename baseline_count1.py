@@ -1,51 +1,65 @@
 def count_ones_in_binary(decimals_file):
     """
-    读取包含十进制数字的文件，统计每个数字二进制表示中1的个数
-    
-    参数:
-        decimals_file: 包含十进制数字的文件路径
+    Read a file containing decimal numbers and count the number of 1s
+    in the binary representation of each number.
+
+    Args:
+        decimals_file: Path to the file containing decimal numbers.
     """
     try:
+        # Open the input file in read mode
         with open(decimals_file, 'r') as file:
             line_number = 0
-            
-            print("十进制\t二进制\t\t1的个数")
+
+            # Print table header
+            print("Decimal\tBinary\t\tNumber of 1s")
             print("-" * 30)
-            
+
+            # Process the file line by line
             for line in file:
                 line_number += 1
-                line = line.strip()  # 去除空白字符
-                
-                if not line:  # 跳过空行
+
+                # Remove leading/trailing whitespace characters
+                line = line.strip()
+
+                # Skip empty lines
+                if not line:
                     continue
-                
+
                 try:
-                    # 转换为整数
+                    # Convert the current line to an integer
                     decimal_num = int(line)
-                    
-                    # 转换为二进制字符串（去掉'0b'前缀）
+
+                    # Convert the decimal number to a binary string
+                    # bin() returns a string like '0b1010', so [2:] removes the '0b' prefix
                     binary_str = bin(decimal_num)[2:]
-                    
-                    # 统计1的个数
+
+                    # Count the number of '1' bits in the binary string
                     ones_count = binary_str.count('1')
-                    
-                    # 输出结果
+
+                    # Print the result in a tabular format
                     print(f"{decimal_num}\t{binary_str}\t\t{ones_count}")
-                    
+
                 except ValueError:
-                    print(f"第 {line_number} 行不是有效的十进制数字: '{line}'")
-                    
+                    # Handle lines that cannot be converted to valid integers
+                    print(f"Line {line_number} is not a valid decimal number: '{line}'")
+
     except FileNotFoundError:
-        print(f"错误: 找不到文件 '{decimals_file}'")
+        # Handle the case where the input file does not exist
+        print(f"Error: File '{decimals_file}' not found.")
+
     except Exception as e:
-        print(f"发生错误: {str(e)}")
+        # Handle any other unexpected errors
+        print(f"An error occurred: {str(e)}")
+
 
 def main():
-    # 文件路径
+    # Define the input file path
     input_file = "decimals.txt"
-    
-    # 调用函数处理文件
+
+    # Process the input file and count 1s in binary representations
     count_ones_in_binary(input_file)
+
 
 if __name__ == "__main__":
     main()
